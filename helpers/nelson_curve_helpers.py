@@ -5,7 +5,7 @@ import plotly.io as pio
 from scipy.optimize import minimize
 
 
-def L1_NSS(x, eps=1e-8):
+def L1_NS(x, eps=1e-8):
     """
     Compute (1 - e^{-x}) / x safely, using Taylor approx near zero for stability
     As x -> 0, (1 - e^{-x}) / x -> 1 - x/2 + x^2/6
@@ -24,7 +24,7 @@ def L1_NSS(x, eps=1e-8):
     return out
 
 
-def L2_NSS(x, eps=1e-8):
+def L2_NS(x, eps=1e-8):
     """(1 - (1+x)e^{-x}) / x -> 1/2 as x->0"""
     x = np.array(x, dtype=float)
     out = np.empty_like(x)
@@ -36,31 +36,34 @@ def L2_NSS(x, eps=1e-8):
     out[small] = 0.5 - xx/6.0 + (xx**2)/24.0
     return out
 
-def NSS_rate(maturities: np.ndarray, params: tuple) -> np.ndarray:
+def NS_rate(maturities: np.ndarray, params: tuple) -> np.ndarray:
     """
-    This function computes the Nelson-Siegel-Svensson rate for given maturities M and parameters.
+    This function computes the Nelson-Siegel rate for given maturities M and parameters.
+    
+    Formula: y(τ) = β₀ + β₁·L₁(τ/λ) + β₂·L₂(τ/λ)
+    
     Parameters:
-    - M: array-like, maturities
-    - beta0, beta1, beta2, beta3: float, NSS parameters
-    - theta1, theta2: float, NSS parameters
+    - maturities: array-like, maturities (τ)
+    - params: tuple of (beta0, beta1, beta2, lambda)
+      - beta0: level factor
+      - beta1: slope factor (loading on L1)
+      - beta2: curvature factor (loading on L2)
+      - lambda: decay parameter (τ/λ)
+    
     Returns:
-    - array-like: NSS rates for each maturity in M
+    - array-like: NS rates for each maturity
     """
-    beta0, beta1, beta2, beta3, theta1, theta2 = params
+    beta0, beta1, beta2, lam = params
     
     maturities = np.array(maturities, dtype=float)
-
-    x1 = maturities / theta1
-    x2 = maturities / theta2
-    return (beta0
-            + beta1 * L1_NSS(x1)
-            + beta2 * L2_NSS(x1)
-            + beta3 * L2_NSS(x2))
+    x = maturities / lam
+    
+    return beta0 + beta1 * L1_NS(x) + beta2 * L2_NS(x)
 
 
-def NSS_residuals(params, M, prices, verbosity: bool = False):
+def NS_residuals(params, M, prices, verbosity: bool = False):
     log_prices = np.log(np.maximum(prices, 1e-8))  # avoid log(0)
-    modeled_log_prices = NSS_rate(M, params)
+    modeled_log_prices = NS_rate(M, params)
     residuals = np.sum((modeled_log_prices - log_prices) ** 2)
     if verbosity:
         print(f"Parameters: {params}")
@@ -70,34 +73,53 @@ def NSS_residuals(params, M, prices, verbosity: bool = False):
     return residuals
 
 
-def NSS_estimation(maturities,prices, initial_guess=(5.5, -2.0, 1.0, 0.5, 100, 200), min_maturity=10, max_maturity = 500, verbosity = False):
-    bounds = [(None,None), (None,None), (None,None), (None,None), (1e-6,500), (1e-6,500)]   # theta1 and theta2 positive
+def NS_estimation(maturities, prices, initial_guess=(5.5, -2.0, 1.0, 50), min_maturity=10, max_maturity=500, verbosity=False):
+    """
+    Estimate 4-parameter Nelson-Siegel model using least squares optimization.
+    
+    Parameters:
+    - maturities: array of time-to-maturity values
+    - prices: array of futures prices
+    - initial_guess: tuple of (beta0, beta1, beta2, lambda) starting values
+    - min_maturity: minimum maturity to include in fit
+    - max_maturity: maximum maturity to include in fit
+    - verbosity: if True, print detailed results
+    
+    Returns:
+    - params: array of [beta0, beta1, beta2, lambda] fitted parameters
+    """
+    # Lambda (decay parameter) must be positive
+    bounds = [(None, None), (None, None), (None, None), (1e-6, 500)]
 
-    # Filter maturities to avoid dealing with contracts too close to expiry, or too far in time, exposed to liquidity issues 
+    # Filter maturities to avoid contracts too close to expiry or too far in time
     mask = (maturities >= min_maturity) & (maturities <= max_maturity)
     maturities = maturities[mask]
     prices = prices[mask]
     
-    result = minimize(NSS_residuals, initial_guess,
+    result = minimize(NS_residuals, initial_guess,
                       args=(maturities, prices, verbosity),
                       method='L-BFGS-B', bounds=bounds)
     if verbosity:
         print("Sum of squared residuals:", result.fun)
-        print(f"Results are: beta0={result.x[0]:,.4f}, beta1={result.x[1]:,.4f}, beta2={result.x[2]:,.4f}, beta3={result.x[3]:,.4f}, theta1={result.x[4]:,.4f}, theta2={result.x[5]:,.4f}")
+        print(f"Fitted parameters:")
+        print(f"  β₀ (level):     {result.x[0]:,.4f}")
+        print(f"  β₁ (slope):     {result.x[1]:,.4f}")
+        print(f"  β₂ (curvature): {result.x[2]:,.4f}")
+        print(f"  λ (decay):      {result.x[3]:,.4f}")
     return result.x
 
-def plot_nss_fits(
+def plot_ns_fits(
     futures_data: pd.DataFrame,
     dates: list,
     col_price: str = "price",
     min_maturity: int = 10,
     max_maturity: int = 500,
     show_actual: bool = True,
-    grid_step: int = 5,      # spacing in business days for the NSS curve
+    grid_step: int = 5,      # spacing in business days for the NS curve
     # alternatively, you could add n_grid: int = 100 and use linspace
 ):
     """
-    Plot NSS fitted curves for several dates on the same plot.
+    Plot NS fitted curves for several dates on the same plot.
 
     Parameters:
     - futures_data: DataFrame with futures data, indexed by date.
@@ -107,9 +129,9 @@ def plot_nss_fits(
     - min_maturity: minimum maturity threshold for fitting
     - max_maturity: maximum maturity threshold for fitting
     - show_actual: if True, plot actual futures prices as markers
-    - grid_step: step (in business days) for evaluating the NSS curve
+    - grid_step: step (in business days) for evaluating the NS curve
 
-    Futures prices are 'X' markers and share the same color as their NSS fit.
+    Futures prices are 'X' markers and share the same color as their NS fit.
     """
 
     fig = go.Figure()
@@ -124,7 +146,7 @@ def plot_nss_fits(
         "#8c564b",  # brown
     ]
 
-    # Grid of maturities (business days) where we evaluate the NSS curve
+    # Grid of maturities (business days) where we evaluate the NS curve
     grid_maturities = np.arange(min_maturity, max_maturity + grid_step, grid_step)
 
     for i, date_str in enumerate(dates):
@@ -148,11 +170,11 @@ def plot_nss_fits(
         if len(maturities) == 0:
             continue  # nothing to fit for this date
 
-        # --- NSS estimation on observed points ---
-        est = NSS_estimation(maturities, prices, verbosity=False)
+        # --- NS estimation on observed points ---
+        est = NS_estimation(maturities, prices, verbosity=False)
 
-        # --- Smooth NSS curve on the regular grid ---
-        modeled_grid = np.exp(NSS_rate(grid_maturities, est))
+        # --- Smooth NS curve on the regular grid ---
+        modeled_grid = np.exp(NS_rate(grid_maturities, est))
 
         fig.add_trace(
             go.Scatter(
@@ -160,7 +182,7 @@ def plot_nss_fits(
                 y=modeled_grid,
                 mode="lines",
                 line=dict(color=color),
-                name=f"NSS Fit {date_str}",
+                name=f"NS Fit {date_str}",
             )
         )
 
@@ -177,7 +199,7 @@ def plot_nss_fits(
             )
 
     fig.update_layout(
-        title="NSS Model Fits Across Dates",
+        title="NS Model Fits Across Dates",
         xaxis_title="Time to Maturity (Business Days)",
         yaxis_title="Futures Price",
         legend_title="Curves",
