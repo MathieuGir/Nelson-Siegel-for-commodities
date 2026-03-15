@@ -12,3 +12,9 @@ data/
 
 # Virtual environments
 .venv
+
+# Python version
+.python-version
+
+# Local gitignore overrides
+.gitignore.local
